@@ -763,6 +763,178 @@ class TestWindowUpdateFrame:
         assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00'
 
 
+class TestWindowUpdateIncrementValidation:
+    """
+    The construction, parsing, and serialization paths of WindowUpdateFrame
+    must apply one single validation rule: increments are integers in the
+    range 1 to 2**31 - 1 (RFC 9113, Section 6.9). No path may accept a value
+    another path rejects, and a failed parse must not leave a half-populated
+    frame behind.
+    """
+
+    MAX_INCREMENT = 2**31 - 1
+
+    @pytest.mark.parametrize("increment", [0, -1, -512, -(2**31)])
+    def test_constructor_rejects_zero_and_negative_increments(self, increment):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=increment)
+
+    @pytest.mark.parametrize("increment", [2**31, 2**31 + 1, 2**63, 10**30])
+    def test_constructor_rejects_overflowing_increments(self, increment):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=increment)
+
+    @pytest.mark.parametrize("increment", [1.5, 512.0, "512", b"\x00", True, False])
+    def test_constructor_rejects_non_integer_increments(self, increment):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=increment)
+
+    @pytest.mark.parametrize("increment", [1, 512, MAX_INCREMENT])
+    def test_constructor_accepts_valid_increments(self, increment):
+        f = WindowUpdateFrame(0, window_increment=increment)
+        assert f.window_increment == increment
+
+    def test_max_increment_serializes_and_parses(self):
+        f = WindowUpdateFrame(3, window_increment=self.MAX_INCREMENT)
+        s = f.serialize()
+        assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x03\x7f\xff\xff\xff'
+
+        parsed = decode_frame(s)
+        assert parsed.window_increment == self.MAX_INCREMENT
+        assert parsed.stream_id == 3
+
+    @pytest.mark.parametrize("increment", [0, -1, -512, 2**31, 2**32])
+    def test_constructor_and_parse_reject_consistently(self, increment):
+        # Whatever the constructor rejects, the parse path rejects with the
+        # same exception type, and vice versa. On the wire an increment of
+        # zero is the only way the 31 masked increment bits can be invalid,
+        # with or without the reserved bit set.
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=increment)
+
+        f, length = Frame.parse_frame_header(b'\x00\x00\x04\x08\x00\x00\x00\x00\x00')
+        assert length == 4
+        for payload in (b'\x00\x00\x00\x00', b'\x80\x00\x00\x00'):
+            with pytest.raises(InvalidDataError):
+                f.parse_body(memoryview(payload))
+
+    def test_parse_zero_increment_rejected(self):
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        with pytest.raises(InvalidDataError):
+            decode_frame(s)
+
+    def test_parse_reserved_bit_with_zero_increment_rejected(self):
+        # Reserved bit set, increment bits all zero: masks to 0, still invalid.
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x80\x00\x00\x00'
+        with pytest.raises(InvalidDataError):
+            decode_frame(s)
+
+    def test_parse_reserved_bit_with_max_increment(self):
+        # Reserved bit set plus all 31 increment bits set: masks to 2^31-1.
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\xff\xff\xff\xff'
+        f = decode_frame(s)
+        assert f.window_increment == self.MAX_INCREMENT
+
+    def test_parse_empty_payload_rejected(self):
+        s = b'\x00\x00\x00\x08\x00\x00\x00\x00\x00'
+        with pytest.raises(InvalidFrameError):
+            decode_frame(s)
+
+    @pytest.mark.parametrize("body_len", [1, 2, 3])
+    def test_parse_truncated_payload_rejected(self, body_len):
+        f, length = Frame.parse_frame_header(b'\x00\x00\x04\x08\x00\x00\x00\x00\x00')
+        assert length == 4
+        with pytest.raises(InvalidFrameError):
+            f.parse_body(memoryview(b'\x00\x00\x02\x00'[:body_len]))
+
+    def test_parse_trailing_bytes_rejected(self):
+        s = b'\x00\x00\x05\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00\xff'
+        with pytest.raises(InvalidFrameError):
+            decode_frame(s)
+
+    @pytest.mark.parametrize("increment", [0, -1, 2**31])
+    def test_mutation_after_construction_is_validated_on_serialize(self, increment):
+        f = WindowUpdateFrame(0, window_increment=512)
+        f.window_increment = increment
+        with pytest.raises(InvalidDataError):
+            f.serialize()
+
+    def test_mutation_after_construction_to_valid_value(self):
+        f = WindowUpdateFrame(0)
+        f.window_increment = self.MAX_INCREMENT
+        s = f.serialize()
+        assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x7f\xff\xff\xff'
+
+    def test_parse_serialize_roundtrip_preserves_bytes(self):
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x00\x04\x00'
+        f = decode_frame(s)
+        assert f.window_increment == 0x400
+        assert f.stream_id == 1
+        assert f.serialize() == s
+
+    def test_failed_parse_does_not_modify_frame(self):
+        f = WindowUpdateFrame(1, window_increment=512)
+        f.body_len = 4
+
+        with pytest.raises(InvalidDataError):
+            f.parse_body(memoryview(b'\x00\x00\x00\x00'))
+        assert f.window_increment == 512
+        assert f.body_len == 4
+
+        with pytest.raises(InvalidFrameError):
+            f.parse_body(memoryview(b'\x00\x00\x02'))
+        assert f.window_increment == 512
+        assert f.body_len == 4
+
+    def test_frame_is_reusable_after_failed_parse(self):
+        f = WindowUpdateFrame(1, window_increment=512)
+
+        with pytest.raises(InvalidDataError):
+            f.parse_body(memoryview(b'\x80\x00\x00\x00'))
+
+        # The frame still serializes its previous valid state, and a later
+        # valid parse still works.
+        assert f.serialize() == b'\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x00\x02\x00'
+        f.parse_body(memoryview(b'\x00\x00\x04\x00'))
+        assert f.window_increment == 0x400
+        assert f.serialize() == b'\x00\x00\x04\x08\x00\x00\x00\x00\x01\x00\x00\x04\x00'
+
+    def test_data_settings_window_update_regression(self):
+        # Legal frames of neighbouring types keep their exact serialized
+        # bytes and parse/serialize roundtrips.
+        data = DataFrame(1)
+        data.data = b'hello'
+        data.flags.add('END_STREAM')
+        s = data.serialize()
+        assert s == b'\x00\x00\x05\x00\x01\x00\x00\x00\x01hello'
+        parsed = decode_frame(s)
+        assert parsed.data == b'hello'
+        assert parsed.serialize() == s
+
+        settings = SettingsFrame(0)
+        settings.settings[SettingsFrame.INITIAL_WINDOW_SIZE] = 65535
+        settings.settings[SettingsFrame.MAX_CONCURRENT_STREAMS] = 100
+        s = settings.serialize()
+        assert s == (
+            b'\x00\x00\x0c\x04\x00\x00\x00\x00\x00'
+            b'\x00\x04\x00\x00\xff\xff'
+            b'\x00\x03\x00\x00\x00\x64'
+        )
+        parsed = decode_frame(s)
+        assert parsed.settings == {
+            SettingsFrame.INITIAL_WINDOW_SIZE: 65535,
+            SettingsFrame.MAX_CONCURRENT_STREAMS: 100,
+        }
+        assert parsed.serialize() == s
+
+        window_update = WindowUpdateFrame(0, window_increment=512)
+        s = window_update.serialize()
+        assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00'
+        parsed = decode_frame(s)
+        assert parsed.window_increment == 512
+        assert parsed.serialize() == s
+
+
 class TestHeadersFrame:
     def test_repr(self):
         f = HeadersFrame(1)

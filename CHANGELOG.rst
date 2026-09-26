@@ -19,7 +19,12 @@ dev
 
 **Bugfixes**
 
--
+- WindowUpdateFrame now validates the window increment consistently on the
+  construction, parsing, and serialization paths via a single shared
+  validation function. Increments must be integers in the range 1 to 2^31-1
+  (RFC 9113, Section 6.9); invalid values raise ``InvalidDataError`` before a
+  usable frame object is produced, and a failed ``parse_body`` no longer
+  leaves the frame in a half-populated state.
 
 6.1.0 (2025-01-22)
 ------------------

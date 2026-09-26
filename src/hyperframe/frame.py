@@ -669,38 +669,38 @@ class WindowUpdateFrame(Frame):
 
     stream_association = _STREAM_ASSOC_EITHER
 
-    def __init__(self, stream_id: int, window_increment: int = 0, **kwargs: Any) -> None:
+    def __init__(self, stream_id: int, window_increment: int | None = None, **kwargs: Any) -> None:
         super().__init__(stream_id, **kwargs)
 
-        #: The amount the flow control window is to be incremented.
-        self.window_increment = window_increment
+        if window_increment is None:
+            # Placeholder used when the increment is not yet known, e.g. when
+            # the frame is created by parse_frame_header before parse_body
+            # runs. It is not a valid increment: serializing or reusing the
+            # frame without setting a real increment will raise.
+            self.window_increment = 0
+        else:
+            #: The amount the flow control window is to be incremented.
+            self.window_increment = _validate_window_increment(window_increment)
 
     def _body_repr(self) -> str:
         return f"window_increment={self.window_increment}"
 
     def serialize_body(self) -> bytes:
         return _STRUCT_L.pack(
-            self.window_increment & 0x7FFFFFFF, # mask off the reserved bit, RFC 9113, Section 6.9
+            _validate_window_increment(self.window_increment) & 0x7FFFFFFF, # mask off the reserved bit, RFC 9113, Section 6.9
         )
 
     def parse_body(self, data: memoryview) -> None:
-        if len(data) > 4:
+        if len(data) != 4:
             msg = f"WINDOW_UPDATE frame must have 4 byte length: got {len(data)}"
             raise InvalidFrameError(msg)
 
-        try:
-            self.window_increment = _STRUCT_L.unpack(data)[0]
-        except struct.error as err:
-            msg = "Invalid WINDOW_UPDATE body"
-            raise InvalidFrameError(msg) from err
-
         # mask off the reserved bit, RFC 9113, Section 6.9
-        self.window_increment = self.window_increment & 0x7FFFFFFF
+        # Validate into a local first: a failed parse must not leave the frame
+        # in a half-populated state or clobber previously valid fields.
+        window_increment = _STRUCT_L.unpack(data)[0] & 0x7FFFFFFF
 
-        if not 1 <= self.window_increment <= 2**31-1:
-            msg = "WINDOW_UPDATE increment must be between 1 to 2^31-1"
-            raise InvalidDataError(msg)
-
+        self.window_increment = _validate_window_increment(window_increment)
         self.body_len = 4
 
 
@@ -927,6 +927,28 @@ def _raw_data_repr(data: bytes | None) -> str:
     if len(r) > 20:
         r = r[:20] + "..."
     return "<hex:" + r + ">"
+
+
+def _validate_window_increment(window_increment: int) -> int:
+    """
+    Validate a WINDOW_UPDATE flow-control window increment.
+
+    This is the single source of truth for increment validation, shared by
+    the construction, parsing, and serialization paths of
+    :class:`WindowUpdateFrame` so that no path accepts an increment that
+    another path rejects. Per RFC 9113, Section 6.9, the legal range is
+    1 to 2^31-1 inclusive.
+
+    :raises hyperframe.exceptions.InvalidDataError: If the increment is not
+        an integer in the valid range.
+    """
+    if not isinstance(window_increment, int) or isinstance(window_increment, bool):
+        msg = f"WINDOW_UPDATE increment must be an integer, got {window_increment!r}"
+        raise InvalidDataError(msg)
+    if not 1 <= window_increment <= 2**31 - 1:
+        msg = f"WINDOW_UPDATE increment must be between 1 and 2^31-1, got {window_increment}"
+        raise InvalidDataError(msg)
+    return window_increment
 
 
 _FRAME_CLASSES: list[type[Frame]] = [
