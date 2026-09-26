@@ -19,7 +19,10 @@ dev
 
 **Bugfixes**
 
--
+- WindowUpdateFrame now validates the window increment consistently on all
+  paths: construction, attribute assignment, and body parsing all enforce the
+  RFC 9113, Section 6.9 range of 1 to 2^31-1 via a single shared check, and a
+  failed parse no longer leaves the frame in a modified state.
 
 6.1.0 (2025-01-22)
 ------------------

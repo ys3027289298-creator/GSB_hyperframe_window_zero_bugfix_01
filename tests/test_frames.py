@@ -762,6 +762,96 @@ class TestWindowUpdateFrame:
         s = f.serialize()
         assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00'
 
+    def test_constructor_zero_increment_raises(self):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=0)
+
+    def test_constructor_negative_increment_raises(self):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=-1)
+
+    def test_constructor_max_increment_accepted(self):
+        f = WindowUpdateFrame(0, window_increment=2**31 - 1)
+        assert f.window_increment == 2**31 - 1
+        s = f.serialize()
+        assert s == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x7f\xff\xff\xff'
+
+    def test_constructor_overflow_increment_raises(self):
+        with pytest.raises(InvalidDataError):
+            WindowUpdateFrame(0, window_increment=2**31)
+
+    def test_parse_zero_increment_raises(self):
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+        with pytest.raises(InvalidDataError):
+            decode_frame(s)
+
+    def test_parse_reserved_bit_only_increment_raises(self):
+        # Reserved bit set with all increment bits zero masks to increment 0.
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x80\x00\x00\x00'
+        with pytest.raises(InvalidDataError):
+            decode_frame(s)
+
+    def test_constructor_and_parse_reject_zero_identically(self):
+        with pytest.raises(InvalidDataError) as constructed:
+            WindowUpdateFrame(0, window_increment=0)
+        with pytest.raises(InvalidDataError) as parsed:
+            decode_frame(b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+        assert str(constructed.value) == str(parsed.value)
+
+    def test_parse_empty_payload_raises(self):
+        s = b'\x00\x00\x00\x08\x00\x00\x00\x00\x00'
+        with pytest.raises(InvalidFrameError):
+            decode_frame(s)
+
+    def test_parse_truncated_payload_raises(self):
+        s = b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02'
+        with pytest.raises(InvalidFrameError):
+            decode_frame(s)
+
+    def test_parse_trailing_bytes_raises(self):
+        s = b'\x00\x00\x05\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00\xff'
+        with pytest.raises(InvalidFrameError):
+            decode_frame(s)
+
+    def test_failed_parse_does_not_modify_frame(self):
+        f, _ = Frame.parse_frame_header(b'\x00\x00\x04\x08\x00\x00\x00\x00\x00')
+        f.window_increment = 512
+        with pytest.raises(InvalidDataError):
+            f.parse_body(memoryview(b'\x00\x00\x00\x00'))
+        assert f.window_increment == 512
+        assert f.serialize() == b'\x00\x00\x04\x08\x00\x00\x00\x00\x00\x00\x00\x02\x00'
+
+    def test_frame_reusable_after_failed_parse(self):
+        f, _ = Frame.parse_frame_header(b'\x00\x00\x04\x08\x00\x00\x00\x00\x00')
+        with pytest.raises(InvalidFrameError):
+            f.parse_body(memoryview(b'\x00\x00'))
+        f.parse_body(memoryview(b'\x00\x00\x02\x00'))
+        assert f.window_increment == 512
+        assert f.body_len == 4
+
+    def test_assignment_after_constructor_validates(self):
+        f = WindowUpdateFrame(0, window_increment=1)
+        f.window_increment = 1024
+        assert f.window_increment == 1024
+        with pytest.raises(InvalidDataError):
+            f.window_increment = 0
+        assert f.window_increment == 1024
+
+    def test_parse_serialize_roundtrip(self):
+        for increment in (1, 512, 2**31 - 1):
+            f = WindowUpdateFrame(3, window_increment=increment)
+            parsed = decode_frame(f.serialize())
+            assert isinstance(parsed, WindowUpdateFrame)
+            assert parsed.stream_id == 3
+            assert parsed.window_increment == increment
+            assert parsed.serialize() == f.serialize()
+
+    def test_roundtrip_with_reserved_bits_set(self):
+        f = WindowUpdateFrame(0x80000003, window_increment=2**31 - 1)
+        parsed = decode_frame(f.serialize())
+        assert parsed.stream_id == 3
+        assert parsed.window_increment == 2**31 - 1
+
 
 class TestHeadersFrame:
     def test_repr(self):

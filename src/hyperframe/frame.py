@@ -647,6 +647,25 @@ class GoAwayFrame(Frame):
             self.additional_data = data[8:].tobytes()
 
 
+def _validate_window_increment(window_increment: int) -> int:
+    """
+    Validate a WINDOW_UPDATE increment as per RFC 9113, Section 6.9: the
+    value must be in the range 1 to 2^31-1 inclusive.
+
+    This single check is shared by WindowUpdateFrame construction,
+    attribute assignment, and body parsing so that all paths accept and
+    reject exactly the same values.
+
+    :param window_increment: The increment to validate.
+    :raises hyperframe.exceptions.InvalidDataError: If the increment is
+        outside the allowed range.
+    """
+    if not 1 <= window_increment <= 2**31 - 1:
+        msg = "WINDOW_UPDATE increment must be between 1 to 2^31-1"
+        raise InvalidDataError(msg)
+    return window_increment
+
+
 class WindowUpdateFrame(Frame):
     """
     The WINDOW_UPDATE frame is used to implement flow control.
@@ -669,11 +688,25 @@ class WindowUpdateFrame(Frame):
 
     stream_association = _STREAM_ASSOC_EITHER
 
-    def __init__(self, stream_id: int, window_increment: int = 0, **kwargs: Any) -> None:
+    def __init__(self, stream_id: int, window_increment: int | None = None, **kwargs: Any) -> None:
         super().__init__(stream_id, **kwargs)
 
+        if window_increment is None:
+            # Frame.parse_frame_header constructs frames before their body is
+            # available: the increment is populated (and validated) later by
+            # parse_body. Bypass validation for this unpopulated state only.
+            self._window_increment = 0
+        else:
+            self.window_increment = window_increment
+
+    @property
+    def window_increment(self) -> int:
         #: The amount the flow control window is to be incremented.
-        self.window_increment = window_increment
+        return self._window_increment
+
+    @window_increment.setter
+    def window_increment(self, window_increment: int) -> None:
+        self._window_increment = _validate_window_increment(window_increment)
 
     def _body_repr(self) -> str:
         return f"window_increment={self.window_increment}"
@@ -684,22 +717,22 @@ class WindowUpdateFrame(Frame):
         )
 
     def parse_body(self, data: memoryview) -> None:
-        if len(data) > 4:
+        if len(data) != 4:
             msg = f"WINDOW_UPDATE frame must have 4 byte length: got {len(data)}"
             raise InvalidFrameError(msg)
 
         try:
-            self.window_increment = _STRUCT_L.unpack(data)[0]
+            window_increment = _STRUCT_L.unpack(data)[0]
         except struct.error as err:
             msg = "Invalid WINDOW_UPDATE body"
             raise InvalidFrameError(msg) from err
 
         # mask off the reserved bit, RFC 9113, Section 6.9
-        self.window_increment = self.window_increment & 0x7FFFFFFF
+        window_increment = window_increment & 0x7FFFFFFF
 
-        if not 1 <= self.window_increment <= 2**31-1:
-            msg = "WINDOW_UPDATE increment must be between 1 to 2^31-1"
-            raise InvalidDataError(msg)
+        # The setter validates via _validate_window_increment before
+        # assigning, so a failed parse leaves this frame unmodified.
+        self.window_increment = window_increment
 
         self.body_len = 4
 
